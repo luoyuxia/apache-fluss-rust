@@ -20,6 +20,8 @@ use crate::rpc::api_version::ApiVersion;
 use crate::rpc::frame::{ReadError, WriteError};
 use crate::rpc::message::{ReadVersionedType, WriteVersionedType};
 use bytes::{Buf, BufMut};
+use prost::Message;
+use crate::proto::ErrorResponse;
 
 #[allow(dead_code)]
 const REQUEST_HEADER_LENGTH: i32 = 8;
@@ -65,7 +67,16 @@ where
     fn read_versioned(reader: &mut R, _version: ApiVersion) -> Result<Self, ReadError> {
         let resp_type = reader.get_u8();
         if resp_type != SUCCESS_RESPONSE {
-            todo!("handle unsuccess response type");
+            let request_id = reader.get_i32();
+            
+            let error_response = ErrorResponse::decode(
+                reader
+            ).unwrap();
+            
+            todo!("handle unsuccess response type {:?}, {:?}",
+                  &error_response.error_code,
+                  &error_response.error_message
+            );
         }
         let request_id = reader.get_i32();
         Ok(ResponseHeader { request_id })
