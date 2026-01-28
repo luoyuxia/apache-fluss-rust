@@ -1151,14 +1151,24 @@ pub struct ReadContext {
     is_from_remote: bool,
 }
 
+/// Projection info for column selection and reordering.
 #[derive(Clone)]
 struct Projection {
-    ordered_schema: SchemaRef,
+    /// Schema used for reading from server (sorted field order for local, full for remote).
+    read_schema: SchemaRef,
+    /// User-requested column indexes in original order.
     projected_fields: Vec<usize>,
+    /// Sorted column indexes for server request (local only).
     ordered_fields: Vec<usize>,
+    /// Indexes to reorder columns from read order to user-requested order.
+    /// Empty if no reordering needed.
+    reorder_map: Vec<usize>,
+}
 
-    reordering_indexes: Vec<usize>,
-    reordering_needed: bool,
+impl Projection {
+    fn needs_reorder(&self) -> bool {
+        !self.reorder_map.is_empty()
+    }
 }
 
 impl ReadContext {
@@ -1179,65 +1189,50 @@ impl ReadContext {
         Self::validate_projection(&arrow_schema, projected_fields.as_slice())?;
         let target_schema =
             Self::project_schema(arrow_schema.clone(), projected_fields.as_slice())?;
-        // the logic is little bit of hard to understand, to refactor it to follow
-        // java side
-        let (need_do_reorder, sorted_fields) = {
-            // currently, for remote read, arrow log doesn't support projection pushdown,
-            // so, only need to do reordering when is not from remote
-            if !is_from_remote {
-                let mut sorted_fields = projected_fields.clone();
-                sorted_fields.sort_unstable();
-                (!sorted_fields.eq(&projected_fields), sorted_fields)
+
+        // For remote read, arrow log doesn't support projection pushdown,
+        // so only need to do reordering when is not from remote
+        let (sorted_fields, reorder_map) = if !is_from_remote {
+            let mut sorted = projected_fields.clone();
+            sorted.sort_unstable();
+
+            if sorted == projected_fields {
+                // Already in order, no reordering needed
+                (sorted, vec![])
             } else {
-                // sorted_fields won't be used when need_do_reorder is false,
-                // let's use an empty vec directly
-                (false, vec![])
+                // Calculate reorder_map: for each user-requested field,
+                // find its position in the sorted order
+                let reorder_map: Result<Vec<usize>> = projected_fields
+                    .iter()
+                    .map(|&idx| {
+                        sorted.binary_search(&idx).map_err(|_| IllegalArgument {
+                            message: format!(
+                                "Projection index {idx} is invalid for the current schema."
+                            ),
+                        })
+                    })
+                    .collect();
+                (sorted, reorder_map?)
             }
+        } else {
+            (vec![], vec![])
         };
 
-        let project = {
-            if need_do_reorder {
-                // reordering is required
-                // Calculate reordering indexes to transform from sorted order to user-requested order
-                let mut reordering_indexes = Vec::with_capacity(projected_fields.len());
-                for &original_idx in &projected_fields {
-                    let pos = sorted_fields.binary_search(&original_idx).map_err(|_| {
-                        IllegalArgument {
-                            message: format!(
-                                "Projection index {original_idx} is invalid for the current schema."
-                            ),
-                        }
-                    })?;
-                    reordering_indexes.push(pos);
-                }
-                Projection {
-                    ordered_schema: Self::project_schema(
-                        arrow_schema.clone(),
-                        sorted_fields.as_slice(),
-                    )?,
-                    projected_fields,
-                    ordered_fields: sorted_fields,
-                    reordering_indexes,
-                    reordering_needed: true,
-                }
+        let projection = Projection {
+            read_schema: if sorted_fields.is_empty() {
+                Self::project_schema(arrow_schema.clone(), projected_fields.as_slice())?
             } else {
-                Projection {
-                    ordered_schema: Self::project_schema(
-                        arrow_schema.clone(),
-                        projected_fields.as_slice(),
-                    )?,
-                    ordered_fields: projected_fields.clone(),
-                    projected_fields,
-                    reordering_indexes: vec![],
-                    reordering_needed: false,
-                }
-            }
+                Self::project_schema(arrow_schema.clone(), sorted_fields.as_slice())?
+            },
+            projected_fields,
+            ordered_fields: sorted_fields,
+            reorder_map,
         };
 
         Ok(ReadContext {
             target_schema,
             full_schema: arrow_schema,
-            projection: Some(project),
+            projection: Some(projection),
             is_from_remote,
         })
     }
@@ -1279,61 +1274,52 @@ impl ReadContext {
     pub fn record_batch(&self, data: &[u8]) -> Result<RecordBatch> {
         let (batch_metadata, body_buffer, version) = parse_ipc_message(data)?;
 
-        let resolve_schema = {
-            // if from remote, no projection, need to use full schema
-            if self.is_from_remote {
-                self.full_schema.clone()
-            } else {
-                // the record batch from server must be ordered by field pos,
-                // according to project to decide what arrow schema to use
-                // to parse the record batch
-                match self.projection {
-                    Some(ref projection) => {
-                        // projection, should use ordered schema by project field pos
-                        projection.ordered_schema.clone()
-                    }
-                    None => {
-                        // no projection, use target output schema
-                        self.target_schema.clone()
-                    }
-                }
+        // Determine schema for reading
+        let read_schema = if self.is_from_remote {
+            // Remote: no projection pushdown, use full schema
+            self.full_schema.clone()
+        } else {
+            match &self.projection {
+                Some(projection) => projection.read_schema.clone(),
+                None => self.target_schema.clone(),
             }
         };
 
         let record_batch = read_record_batch(
             &body_buffer,
             batch_metadata,
-            resolve_schema,
+            read_schema,
             &HashMap::new(),
             None,
             &version,
         )?;
 
+        // Apply column reordering if needed
         let record_batch = match &self.projection {
             Some(projection) => {
-                let reordered_columns = {
-                    // need to do reorder
-                    if self.is_from_remote {
-                        Some(&projection.projected_fields)
-                    } else if projection.reordering_needed {
-                        Some(&projection.reordering_indexes)
-                    } else {
-                        None
-                    }
+                let reorder_indexes = if self.is_from_remote {
+                    // Remote: reorder from full schema to user order
+                    Some(&projection.projected_fields)
+                } else if projection.needs_reorder() {
+                    // Local: reorder from sorted order to user order
+                    Some(&projection.reorder_map)
+                } else {
+                    None
                 };
-                match reordered_columns {
-                    Some(reordered_columns) => {
-                        let arrow_columns = reordered_columns
-                            .iter()
-                            .map(|&idx| record_batch.column(idx).clone())
-                            .collect();
-                        RecordBatch::try_new(self.target_schema.clone(), arrow_columns)?
-                    }
-                    _ => record_batch,
+
+                if let Some(indexes) = reorder_indexes {
+                    let columns: Vec<_> = indexes
+                        .iter()
+                        .map(|&idx| record_batch.column(idx).clone())
+                        .collect();
+                    RecordBatch::try_new(self.target_schema.clone(), columns)?
+                } else {
+                    record_batch
                 }
             }
-            _ => record_batch,
+            None => record_batch,
         };
+
         Ok(record_batch)
     }
 

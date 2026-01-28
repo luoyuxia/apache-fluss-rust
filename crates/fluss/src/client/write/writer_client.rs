@@ -122,16 +122,10 @@ impl WriterClient {
         table_path: &Arc<TablePath>,
     ) -> Result<(Arc<Box<dyn BucketAssigner>>, i32)> {
         let cluster = self.metadata.get_cluster();
-        let bucket_assigner = {
-            if let Some(assigner) = self.bucket_assigners.get(table_path) {
-                assigner.clone()
-            } else {
-                let assigner = Arc::new(Self::create_bucket_assigner(table_path.as_ref()));
-                self.bucket_assigners
-                    .insert(table_path.as_ref().clone(), assigner.clone());
-                assigner
-            }
-        };
+        let bucket_assigner = self.bucket_assigners
+            .entry(table_path.as_ref().clone())
+            .or_insert_with(|| Arc::new(Self::create_bucket_assigner(table_path.as_ref())))
+            .clone();
         let bucket_id = bucket_assigner.assign_bucket(bucket_key, &cluster)?;
         Ok((bucket_assigner, bucket_id))
     }

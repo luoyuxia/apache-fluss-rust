@@ -21,7 +21,7 @@ use crate::client::metadata::Metadata;
 use crate::client::write::batch::WriteBatch;
 use crate::client::{ReadyWriteBatch, RecordAccumulator};
 use crate::error::Error::UnexpectedError;
-use crate::error::{FlussError, Result};
+use crate::error::{Error, FlussError, Result};
 use crate::metadata::{TableBucket, TablePath};
 use crate::proto::{
     PbProduceLogRespForBucket, PbPutKvRespForBucket, ProduceLogResponse, PutKvResponse,
@@ -32,11 +32,13 @@ use log::warn;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 
 #[allow(dead_code)]
 pub struct Sender {
-    running: bool,
+    running: AtomicBool,
     metadata: Arc<Metadata>,
     accumulator: Arc<RecordAccumulator>,
     in_flight_batches: Mutex<HashMap<TableBucket, Vec<i64>>>,
@@ -56,7 +58,7 @@ impl Sender {
         retries: i32,
     ) -> Self {
         Self {
-            running: true,
+            running: AtomicBool::new(false),
             metadata,
             accumulator,
             in_flight_batches: Default::default(),
@@ -69,7 +71,7 @@ impl Sender {
 
     pub async fn run(&self) -> Result<()> {
         loop {
-            if !self.running {
+            if !self.running.load(SeqCst) {
                 return Ok(());
             }
             self.run_once().await?;
@@ -235,7 +237,13 @@ impl Sender {
         timeout_ms: i32,
         request_batches: &mut [ReadyWriteBatch],
     ) -> Result<WriteRequest> {
-        let first_batch = &request_batches.first().unwrap().write_batch;
+        let first_batch = &request_batches.first()
+            .ok_or_else(|| {
+                UnexpectedError {
+                    message: "request_batches is empty, can't build write request.".to_string(),
+                    source: None,
+                }
+            })?.write_batch;
 
         let request = match first_batch {
             WriteBatch::ArrowLog(_) => {
@@ -523,7 +531,7 @@ impl Sender {
     }
 
     pub async fn close(&mut self) {
-        self.running = false;
+        self.running.store(false, SeqCst);
     }
 }
 

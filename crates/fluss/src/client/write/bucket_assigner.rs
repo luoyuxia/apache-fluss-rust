@@ -47,7 +47,7 @@ impl StickyBucketAssigner {
     }
 
     fn next_bucket(&self, cluster: &Cluster, prev_bucket_id: i32) -> i32 {
-        let old_bucket = self.current_bucket_id.load(Ordering::Relaxed);
+        let old_bucket = self.current_bucket_id.load(Ordering::SeqCst);
         let mut new_bucket = old_bucket;
         if old_bucket < 0 || old_bucket == prev_bucket_id {
             let available_buckets = cluster.get_available_buckets_for_table_path(&self.table_path);
@@ -71,18 +71,18 @@ impl StickyBucketAssigner {
         }
 
         if old_bucket < 0 {
-            self.current_bucket_id.store(new_bucket, Ordering::Relaxed);
+            self.current_bucket_id.store(new_bucket, Ordering::SeqCst);
         } else {
             self.current_bucket_id
                 .compare_exchange(
                     prev_bucket_id,
                     new_bucket,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
                 )
                 .ok();
         }
-        self.current_bucket_id.load(Ordering::Relaxed)
+        self.current_bucket_id.load(Ordering::SeqCst)
     }
 }
 
