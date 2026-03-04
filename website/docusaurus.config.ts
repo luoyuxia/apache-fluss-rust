@@ -7,8 +7,8 @@ const config: Config = {
   tagline: 'Rust, Python, and C++ clients for Apache Fluss',
   favicon: 'img/logo/fluss_favicon.svg',
 
-  url: 'https://clients.fluss.apache.org',
-  baseUrl: '/',
+  url: 'https://luoyuxia.github.io',
+  baseUrl: '/apache-fluss-rust/',
 
   organizationName: 'apache',
   projectName: 'fluss-rust',
